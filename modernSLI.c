@@ -1,7 +1,7 @@
 /*
  * modernSLI - enable SLI on unsupported configs
  *
- * Two things are needed:
+ * Two things are needed, and neither works without the other:
  *
  *   1. RMSLIAlwaysApproved=1 in the driver's registry keys. The driver reads
  *      this by name and sets an internal flag.
@@ -21,9 +21,8 @@
  * Whether that branch is made unconditional or removed depends on which way
  * it points, which is worked out from the flag test rather than assumed.
  *
- *
  * Build: cl /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS modernSLI.c
- *        /link advapi32.lib shell32.lib setupapi.lib
+ *        /link advapi32.lib shell32.lib setupapi.lib crypt32.lib
  */
 
 #include <windows.h>
@@ -31,6 +30,11 @@
 #include <setupapi.h>
 #include <aclapi.h>
 #include <stdio.h>
+
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "crypt32.lib")
 
 static const GUID DISPLAY_CLASS =
     { 0x4d36e968, 0xe325, 0x11ce,
@@ -44,8 +48,6 @@ static unsigned char *g_img;
 static size_t         g_len;
 static IMAGE_SECTION_HEADER *g_sec;
 static DWORD          g_nsec;
-
-/* ---------------------------------------------------------------- image */
 
 static int load_image(const char *path)
 {
@@ -82,7 +84,7 @@ static DWORD to_rva(size_t off)
     return 0;
 }
 
-/* -------------------------------------------------------------- locator */
+// locator
 
 /* Conditional jump: returns its length and where it goes. */
 static int jcc(size_t off, size_t *len, DWORD *target)
@@ -190,7 +192,6 @@ static int patch(void)
     return 1;
 }
 
-/* ----------------------------------------------------------- privileges */
 
 static int elevated(void)
 {
@@ -218,8 +219,6 @@ static void relaunch(void)
     }
 }
 
-/* DriverStore files belong to TrustedInstaller; an admin still cannot write
- * them until the owner and DACL are changed. */
 static int take_ownership(const char *path)
 {
     HANDLE tok; TOKEN_PRIVILEGES tp; PSID adm = NULL; PACL acl = NULL;
@@ -257,8 +256,6 @@ out:
     return ok;
 }
 
-/* ------------------------------------------------------------- external */
-
 static int run(const char *cmd)
 {
     STARTUPINFOA si = { sizeof(si) };
@@ -275,30 +272,218 @@ static int run(const char *cmd)
     return code == 0;
 }
 
-static int sign(const char *path)
+/*
+ * Signing.
+ */
+static int have_selfsigned_cmdlet(void)
 {
-    char cmd[3072];
+    OSVERSIONINFOEXA os;
+    DWORDLONG m = 0;
+    ZeroMemory(&os, sizeof(os));
+    os.dwOSVersionInfoSize = sizeof(os);
+    os.dwMajorVersion = 6;
+    os.dwMinorVersion = 2;
+    VER_SET_CONDITION(m, VER_MAJORVERSION, VER_GREATER_EQUAL);
+    VER_SET_CONDITION(m, VER_MINORVERSION, VER_GREATER_EQUAL);
+    return VerifyVersionInfoA(&os, VER_MAJORVERSION | VER_MINORVERSION, m) != 0;
+}
+
+/* Windows 7: build the certificate with certreq and import it. */
+static int make_cert_win7(void)
+{
+    char inf[MAX_PATH], cer[MAX_PATH], cmd[1024];
+    UINT n = GetTempPathA(MAX_PATH, inf);
+    FILE *f;
+
+    strcpy_s(cer, MAX_PATH, inf);
+    _snprintf_s(inf + n, MAX_PATH - n, _TRUNCATE, "modernSLI.inf");
+    _snprintf_s(cer + n, MAX_PATH - n, _TRUNCATE, "modernSLI.cer");
+
+    f = fopen(inf, "w");
+    if (!f) return 0;
+    fprintf(f,
+        "[Version]\r\nSignature=\"$Windows NT$\"\r\n"
+        "[NewRequest]\r\n"
+        "Subject=\"CN=%s\"\r\n"
+        "KeyLength=2048\r\n"
+        "KeyUsage=0x80\r\n"                      /* digitalSignature */
+        "MachineKeySet=false\r\n"
+        "KeySpec=2\r\n"
+        "ProviderName=\"Microsoft Enhanced Cryptographic Provider v1.0\"\r\n"
+        "ProviderType=1\r\n"
+        "RequestType=Cert\r\n"
+        "ValidityPeriod=Years\r\n"
+        "ValidityPeriodUnits=5\r\n"
+        "Exportable=true\r\n"
+        "[EnhancedKeyUsageExtension]\r\n"
+        "OID=1.3.6.1.5.5.7.3.3\r\n",             /* code signing */
+        CERT_NAME);
+    fclose(f);
+
+    _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                "certreq -q -new -f \"%s\" \"%s\"", inf, cer);
+    if (!run(cmd)) return 0;
+
+    _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                "certutil -addstore -f Root \"%s\"", cer);
+    run(cmd);
+    _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                "certutil -addstore -f TrustedPublisher \"%s\"", cer);
+    run(cmd);
+    return 1;
+}
+
+/*
+ * Signing.
+ */
+
+typedef struct { DWORD cbSize; LPCWSTR pwszFileName; HANDLE hFile; } SGN_FILE;
+typedef struct { DWORD cbSize; DWORD *pdwIndex; DWORD dwSubjectChoice;
+                 SGN_FILE *pSignerFileInfo; } SGN_SUBJECT;
+typedef struct { DWORD cbSize; PCCERT_CONTEXT pSigningCert; DWORD dwCertPolicy;
+                 HCERTSTORE hCertStore; } SGN_CERT_STORE;
+typedef struct { DWORD cbSize; DWORD dwCertChoice;
+                 SGN_CERT_STORE *pCertStoreInfo; HWND hwnd; } SGN_CERT;
+typedef struct { DWORD cbSize; ALG_ID algidHash; DWORD dwAttrChoice;
+                 void *pAttrAuthcode; PCRYPT_ATTRIBUTES psAuthenticated;
+                 PCRYPT_ATTRIBUTES psUnauthenticated; } SGN_SIGINFO;
+
+typedef HRESULT (WINAPI *PFN_SIGNER_SIGN_EX)(DWORD, SGN_SUBJECT *, SGN_CERT *,
+                                             SGN_SIGINFO *, void *, LPCWSTR,
+                                             PCRYPT_ATTRIBUTES, void *, void **);
+
+static int sign_native(const char *path)
+{
+    HCERTSTORE store;
+    PCCERT_CONTEXT cert;
+    HMODULE lib;
+    PFN_SIGNER_SIGN_EX fn;
+    SGN_FILE file;
+    SGN_SUBJECT subj;
+    SGN_CERT_STORE cs;
+    SGN_CERT sc;
+    SGN_SIGINFO si;
+    DWORD index = 0;
+    void *ctx = NULL;
+    wchar_t wpath[MAX_PATH];
+    HRESULT hr;
+
+    MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+
+    store = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
+                          CERT_SYSTEM_STORE_CURRENT_USER, "MY");
+    if (!store) { printf("  cannot open the certificate store\n"); return 0; }
+
+    cert = CertFindCertificateInStore(store, X509_ASN_ENCODING, 0,
+                                      CERT_FIND_SUBJECT_STR_A, CERT_NAME, NULL);
+    if (!cert) {
+        printf("  certificate not found in the store\n");
+        CertCloseStore(store, 0);
+        return 0;
+    }
+
+    lib = LoadLibraryA("mssign32.dll");
+    fn = lib ? (PFN_SIGNER_SIGN_EX)GetProcAddress(lib, "SignerSignEx") : NULL;
+    if (!fn) {
+        printf("  mssign32.dll unavailable\n");
+        CertFreeCertificateContext(cert);
+        CertCloseStore(store, 0);
+        return 0;
+    }
+
+    ZeroMemory(&file, sizeof(file));
+    file.cbSize = sizeof(file);
+    file.pwszFileName = wpath;
+
+    ZeroMemory(&subj, sizeof(subj));
+    subj.cbSize = sizeof(subj);
+    subj.pdwIndex = &index;
+    subj.dwSubjectChoice = 1;              /* a file */
+    subj.pSignerFileInfo = &file;
+
+    ZeroMemory(&cs, sizeof(cs));
+    cs.cbSize = sizeof(cs);
+    cs.pSigningCert = cert;
+    cs.dwCertPolicy = 2;                   /* build a chain */
+    cs.hCertStore = store;
+
+    ZeroMemory(&sc, sizeof(sc));
+    sc.cbSize = sizeof(sc);
+    sc.dwCertChoice = 2;                   /* from a store */
+    sc.pCertStoreInfo = &cs;
+
+    ZeroMemory(&si, sizeof(si));
+    si.cbSize = sizeof(si);
+    /* Windows 7 without the SHA-2 update cannot verify SHA256 kernel
+     * signatures, so sign with SHA1 there. */
+    si.algidHash = have_selfsigned_cmdlet() ? CALG_SHA_256 : CALG_SHA1;
+    si.dwAttrChoice = 0;
+
+    hr = fn(0, &subj, &sc, &si, NULL, NULL, NULL, NULL, &ctx);
+
+    CertFreeCertificateContext(cert);
+    CertCloseStore(store, 0);
+    FreeLibrary(lib);
+
+    if (hr != S_OK) {
+        printf("  SignerSignEx failed: %#lx\n", (unsigned long)hr);
+        return 0;
+    }
+    return 1;
+}
+
+/* Create the certificate if it is not already in the store. */
+static int ensure_cert(void)
+{
+    char cmd[2048];
+
+    _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"if (Get-ChildItem Cert:\\CurrentUser\\My|"
+        "?{$_.Subject -eq 'CN=%s' -and $_.HasPrivateKey}) {exit 0} "
+        "else {exit 1}\"", CERT_NAME);
+    if (run(cmd)) return 1;
+
+    printf("  creating a certificate\n");
+
+    if (!have_selfsigned_cmdlet()) return make_cert_win7();
+
     _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
         "powershell -NoProfile -ExecutionPolicy Bypass -Command "
         "\"$ErrorActionPreference='Stop'; $s='CN=%s';"
-        "$c=Get-ChildItem Cert:\\CurrentUser\\My|?{$_.Subject -eq $s}|"
-        "select -First 1;"
-        "if(-not $c){$c=New-SelfSignedCertificate -Type CodeSigningCert "
-        "-Subject $s -CertStoreLocation Cert:\\CurrentUser\\My "
+        "$c=New-SelfSignedCertificate -Type CodeSigningCert -Subject $s "
+        "-CertStoreLocation Cert:\\CurrentUser\\My "
         "-KeyUsage DigitalSignature -KeyExportPolicy Exportable "
-        "-NotAfter (Get-Date).AddYears(5)};"
+        "-NotAfter (Get-Date).AddYears(5);"
         "$f=[IO.Path]::Combine($env:TEMP,'modernSLI.cer');"
         "Export-Certificate -Cert $c -FilePath $f -Force|Out-Null;"
         "certutil -addstore -f Root $f|Out-Null;"
-        "certutil -addstore -f TrustedPublisher $f|Out-Null;"
-        "$r=Set-AuthenticodeSignature -FilePath '%s' -Certificate $c "
-        "-HashAlgorithm SHA256;"
-        "if($r.Status -ne 'Valid'){Write-Host $r.StatusMessage;exit 1}\"",
-        CERT_NAME, path);
+        "certutil -addstore -f TrustedPublisher $f|Out-Null\"", CERT_NAME);
     return run(cmd);
 }
 
-// devices
+static int sign(const char *path)
+{
+    int attempt;
+
+    /*
+     * Two attempts: a certificate left by an earlier run may be unusable in a
+     * way that only shows up when signing, so it gets replaced once.
+     */
+    for (attempt = 0; attempt < 2; attempt++) {
+        char cmd[512];
+        if (!ensure_cert()) return 0;
+        if (sign_native(path)) return 1;
+        if (attempt == 0) {
+            printf("  removing that certificate and retrying\n");
+            _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                        "certutil -user -delstore My \"%s\"", CERT_NAME);
+            run(cmd);
+        }
+    }
+    return 0;
+}
+
 
 static int devices(BOOL enable)
 {
@@ -327,8 +512,6 @@ static int devices(BOOL enable)
     return n;
 }
 
-// registry
-
 static void set_dword(HKEY root, const char *sub, const char *name, DWORD v)
 {
     HKEY k;
@@ -338,11 +521,6 @@ static void set_dword(HKEY root, const char *sub, const char *name, DWORD v)
     RegCloseKey(k);
 }
 
-/*
- * Which key the RM reads varies by branch, so write them all. The per-adapter
- * driver keys are enumerated rather than assumed: their indices change when a
- * driver is reinstalled.
- */
 static void regkeys(void)
 {
     static const char *fixed[] = {
@@ -381,7 +559,6 @@ static void regkeys(void)
     RegCloseKey(cls);
 }
 
-
 static int find_driver(char *out, size_t cch)
 {
     HKEY k;
@@ -413,7 +590,6 @@ static int find_driver(char *out, size_t cch)
     return 0;
 }
 
-
 int main(int argc, char **argv)
 {
     char live[MAX_PATH], tmp[MAX_PATH], sys32[MAX_PATH];
@@ -429,7 +605,6 @@ int main(int argc, char **argv)
     }
     printf("driver: %s\n", live);
 
-    /* Patch a copy - the live file is mapped and cannot be written. */
     n = GetTempPathA(MAX_PATH, tmp);
     _snprintf_s(tmp + n, MAX_PATH - n, _TRUNCATE, "nvlddmkm.patched.sys");
     if (!CopyFileA(live, tmp, FALSE) || !load_image(tmp)) {
@@ -443,15 +618,17 @@ int main(int argc, char **argv)
     fwrite(g_img, 1, g_len, f);
     fclose(f);
 
+    printf("registry\n");
+    regkeys();
+    printf("test signing\n");
+    if (!run("bcdedit /set testsigning on"))
+        printf("  bcdedit failed - set it by hand: bcdedit /set testsigning on\n");
+
     printf("signing\n");
     if (!sign(tmp)) {
         printf("signing failed - the driver will not load unsigned\n");
         goto done;
     }
-
-    printf("registry\n");
-    regkeys();
-    run("bcdedit /set testsigning on");
 
     printf("replacing (the screen may blank)\n");
     devices(FALSE);
@@ -462,7 +639,6 @@ int main(int argc, char **argv)
     else
         printf("  %s\n", live);
 
-    /* Some packages also keep a copy here; update it if so. */
     n = GetSystemDirectoryA(sys32, MAX_PATH);
     _snprintf_s(sys32 + n, MAX_PATH - n, _TRUNCATE, "\\drivers\\nvlddmkm.sys");
     if (_stricmp(sys32, live) && GetFileAttributesA(sys32) != INVALID_FILE_ATTRIBUTES) {
