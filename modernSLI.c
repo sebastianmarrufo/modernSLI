@@ -1,5 +1,5 @@
 /*
- * slipatch - enable SLI on unsupported configs
+ * modernSLI - enable SLI on unsupported configs
  *
  * Two things are needed:
  *
@@ -22,7 +22,7 @@
  * it points, which is worked out from the flag test rather than assumed.
  *
  *
- * Build: cl /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS slipatch.c
+ * Build: cl /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS modernSLI.c
  *        /link advapi32.lib shell32.lib setupapi.lib
  */
 
@@ -287,7 +287,7 @@ static int sign(const char *path)
         "-Subject $s -CertStoreLocation Cert:\\CurrentUser\\My "
         "-KeyUsage DigitalSignature -KeyExportPolicy Exportable "
         "-NotAfter (Get-Date).AddYears(5)};"
-        "$f=[IO.Path]::Combine($env:TEMP,'slipatch.cer');"
+        "$f=[IO.Path]::Combine($env:TEMP,'modernSLI.cer');"
         "Export-Certificate -Cert $c -FilePath $f -Force|Out-Null;"
         "certutil -addstore -f Root $f|Out-Null;"
         "certutil -addstore -f TrustedPublisher $f|Out-Null;"
