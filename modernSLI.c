@@ -21,6 +21,7 @@
  * Whether that branch is made unconditional or removed depends on which way
  * it points, which is worked out from the flag test rather than assumed.
  *
+ *
  * Build: cl /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS modernSLI.c
  *        /link advapi32.lib shell32.lib setupapi.lib crypt32.lib
  */
@@ -48,6 +49,8 @@ static unsigned char *g_img;
 static size_t         g_len;
 static IMAGE_SECTION_HEADER *g_sec;
 static DWORD          g_nsec;
+
+/* ---------------------------------------------------------------- image */
 
 static int load_image(const char *path)
 {
@@ -84,7 +87,6 @@ static DWORD to_rva(size_t off)
     return 0;
 }
 
-// locator
 
 /* Conditional jump: returns its length and where it goes. */
 static int jcc(size_t off, size_t *len, DWORD *target)
@@ -169,7 +171,11 @@ static int patch(void)
             break;
         }
     }
-    if (!found) { printf("  approval branch not found\n"); return 0; }
+    if (!found) {
+        printf("  approval branch not found - either this driver version is\n"
+               "  not supported, or it has already been patched\n");
+        return 0;
+    }
     if (found > 1) { printf("  %d candidate branches - refusing to guess\n", found); return 0; }
 
     if (g_img[hit] == 0xEB || g_img[hit] == 0xE9 || g_img[hit] == 0x90) {
@@ -306,7 +312,7 @@ static int make_cert_win7(void)
         "[NewRequest]\r\n"
         "Subject=\"CN=%s\"\r\n"
         "KeyLength=2048\r\n"
-        "KeyUsage=0x80\r\n"                      /* digitalSignature */
+        "KeyUsage=0x80\r\n" 
         "MachineKeySet=false\r\n"
         "KeySpec=2\r\n"
         "ProviderName=\"Microsoft Enhanced Cryptographic Provider v1.0\"\r\n"
@@ -316,7 +322,7 @@ static int make_cert_win7(void)
         "ValidityPeriodUnits=5\r\n"
         "Exportable=true\r\n"
         "[EnhancedKeyUsageExtension]\r\n"
-        "OID=1.3.6.1.5.5.7.3.3\r\n",             /* code signing */
+        "OID=1.3.6.1.5.5.7.3.3\r\n",
         CERT_NAME);
     fclose(f);
 
@@ -333,9 +339,6 @@ static int make_cert_win7(void)
     return 1;
 }
 
-/*
- * Signing.
- */
 
 typedef struct { DWORD cbSize; LPCWSTR pwszFileName; HANDLE hFile; } SGN_FILE;
 typedef struct { DWORD cbSize; DWORD *pdwIndex; DWORD dwSubjectChoice;
@@ -466,10 +469,6 @@ static int sign(const char *path)
 {
     int attempt;
 
-    /*
-     * Two attempts: a certificate left by an earlier run may be unusable in a
-     * way that only shows up when signing, so it gets replaced once.
-     */
     for (attempt = 0; attempt < 2; attempt++) {
         char cmd[512];
         if (!ensure_cert()) return 0;
@@ -483,7 +482,6 @@ static int sign(const char *path)
     }
     return 0;
 }
-
 
 static int devices(BOOL enable)
 {
@@ -590,6 +588,17 @@ static int find_driver(char *out, size_t cch)
     return 0;
 }
 
+
+static int ask(const char *q)
+{
+    int c, first;
+    printf("%s (y/n) ", q);
+    fflush(stdout);
+    first = c = getchar();
+    while (c != '\n' && c != EOF) c = getchar();
+    return first == 'y' || first == 'Y';
+}
+
 int main(int argc, char **argv)
 {
     char live[MAX_PATH], tmp[MAX_PATH], sys32[MAX_PATH];
@@ -611,7 +620,19 @@ int main(int argc, char **argv)
         printf("could not stage a copy\n");
         goto done;
     }
-    if (!patch()) goto done;
+    if (!patch()) {
+        printf("\n");
+        if (ask("Set the registry values anyway?")) {
+            printf("\nregistry\n");
+            regkeys();
+            printf("test signing\n");
+            if (!run("bcdedit /set testsigning on"))
+                printf("  bcdedit failed - set it by hand:"
+                       " bcdedit /set testsigning on\n");
+            printf("\ndone - reboot to apply\n");
+        }
+        goto done;
+    }
 
     f = fopen(tmp, "wb");
     if (!f) { printf("could not write the patched copy\n"); goto done; }
