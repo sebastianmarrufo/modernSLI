@@ -9,3 +9,5 @@ But have more testing to do.
 
 Just double click the exe after installing two cards and drivers, then reboot. If you already had test signing enabled, then go ahead and check
 nvidia control panel.
+
+NVIDIA and SLI are trademarks and/or registered trademarks of NVIDIA Corporation in the U.S. and other countries.
