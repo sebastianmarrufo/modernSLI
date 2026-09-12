@@ -1,25 +1,16 @@
 /*
  * modernSLI - enable SLI on unsupported configs
  *
- * Two things are needed, and neither works without the other:
- *
- *   1. RMSLIAlwaysApproved=1 in the driver's registry keys. The driver reads
- *      this by name and sets an internal flag.
- *
- *   2. A one-instruction patch to the branch that flag gates. The flag alone
- *      only earns a call whose return value decides the outcome, and on an
- *      uncertified platform that call returns false.
- *
- * The patch site is found by signature rather than by offset:
+ * The site is found by signature rather than by offset. The string is only an
+ * anchor; the flag offset is read out of the driver, so a layout change
+ * between versions does not matter:
  *
  *      "RMSLIAlwaysApproved"
  *        -> the RIP-relative LEA that references it
  *          -> the byte store after it            (gives the flag offset)
  *            -> the cmp of that flag elsewhere   (the consumer)
- *              -> test al,al and its branch      (what gets rewritten)
- *
- * Whether that branch is made unconditional or removed depends on which way
- * it points, which is worked out from the flag test rather than assumed.
+ *              -> the flag test branch           (removed)
+ *              -> test al,al and its branch      (forced)
  *
  *
  * Build: cl /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS modernSLI.c
@@ -41,14 +32,13 @@ static const GUID DISPLAY_CLASS =
     { 0x4d36e968, 0xe325, 0x11ce,
       { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
 
-#define CLASS_KEY "SYSTEM\\CurrentControlSet\\Control\\Class\\" \
-                  "{4d36e968-e325-11ce-bfc1-08002be10318}"
-#define CERT_NAME "SLI Patch Cert"
+#define CERT_NAME "modernSLI Cert"
 
 static unsigned char *g_img;
 static size_t         g_len;
 static IMAGE_SECTION_HEADER *g_sec;
 static DWORD          g_nsec;
+
 
 static int load_image(const char *path)
 {
@@ -85,7 +75,6 @@ static DWORD to_rva(size_t off)
     return 0;
 }
 
-
 /* Conditional jump: returns its length and where it goes. */
 static int jcc(size_t off, size_t *len, DWORD *target)
 {
@@ -106,8 +95,9 @@ static int jcc(size_t off, size_t *len, DWORD *target)
 static int patch(void)
 {
     static const char anchor[] = "RMSLIAlwaysApproved";
-    size_t i, ref = 0, hit = 0, hitLen = 0;
+    size_t i, ref = 0, hit = 0, hitLen = 0, gate = 0, gateLen = 0;
     DWORD srva = 0, skip, target;
+    size_t gateOff = 0, gateJlen = 0;
     int flag = 0, found = 0, makeJmp = 0;
 
     /* the string */
@@ -154,12 +144,15 @@ static int patch(void)
         else continue;
 
         if (!jcc(i + clen, &jlen, &skip)) continue;      /* flag clear -> SKIP */
+        gateOff = i + clen;                              /* remember it */
+        gateJlen = jlen;
 
         for (q = i + clen + jlen; q + 8 < i + 0x50 && q + 2 <= g_len; q++) {
             if (g_img[q] != 0x84 || g_img[q + 1] != 0xC0) continue;
             if (!jcc(q + 2, &jlen, &target)) break;
             if (found && hit == q + 2) break;            /* REX double match */
             if (!found) {
+                gate = gateOff; gateLen = gateJlen;
                 hit = q + 2; hitLen = jlen;
                 /* Going to SKIP means giving up, so remove it. Anything else
                  * is the approved path, so always take it. */
@@ -178,10 +171,15 @@ static int patch(void)
 
     if (g_img[hit] == 0xEB || g_img[hit] == 0xE9 || g_img[hit] == 0x90) {
         printf("  already patched\n");
-        return 1;
+        return 0;
     }
     printf("  branch at rva %#lx: %s\n", to_rva(hit),
            makeJmp ? "making it unconditional" : "removing it");
+
+    if (gate && gateLen) {
+        memset(g_img + gate, 0x90, gateLen);
+        printf("  flag test at rva %#lx: removed\n", to_rva(gate));
+    }
 
     if (!makeJmp) {
         memset(g_img + hit, 0x90, hitLen);
@@ -195,7 +193,6 @@ static int patch(void)
     }
     return 1;
 }
-
 
 static int elevated(void)
 {
@@ -276,9 +273,6 @@ static int run(const char *cmd)
     return code == 0;
 }
 
-/*
- * Signing.
- */
 static int have_selfsigned_cmdlet(void)
 {
     OSVERSIONINFOEXA os;
@@ -480,80 +474,6 @@ static int sign(const char *path)
     return 0;
 }
 
-static int devices(BOOL enable)
-{
-    HDEVINFO di = SetupDiGetClassDevsA(&DISPLAY_CLASS, 0,0, DIGCF_PRESENT);
-    SP_DEVINFO_DATA dev = { sizeof(dev) };
-    DWORD i = 0;
-    int n = 0;
-
-    if (di == INVALID_HANDLE_VALUE) return 0;
-    while (SetupDiEnumDeviceInfo(di, i++, &dev)) {
-        char hw[512] = { 0 };
-        SP_PROPCHANGE_PARAMS p;
-        if (!SetupDiGetDeviceRegistryPropertyA(di, &dev, SPDRP_HARDWAREID, 0,
-                                               (PBYTE)hw, sizeof(hw), 0)) continue;
-        if (!strstr(hw, "VEN_10DE")) continue;
-        ZeroMemory(&p, sizeof(p));
-        p.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
-        p.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-        p.StateChange = enable ? DICS_ENABLE : DICS_DISABLE;
-        p.Scope = DICS_FLAG_CONFIGSPECIFIC;
-        if (SetupDiSetClassInstallParamsA(di, &dev,
-                (SP_CLASSINSTALL_HEADER *)&p, sizeof(p)) &&
-            SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, di, &dev)) n++;
-    }
-    SetupDiDestroyDeviceInfoList(di);
-    return n;
-}
-
-static void set_dword(HKEY root, const char *sub, const char *name, DWORD v)
-{
-    HKEY k;
-    if (RegCreateKeyExA(root, sub, 0,0,0, KEY_SET_VALUE | KEY_WOW64_64KEY,
-                        0, &k, 0)) return;
-    RegSetValueExA(k, name, 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-    RegCloseKey(k);
-}
-
-static void regkeys(void)
-{
-    static const char *fixed[] = {
-        "SYSTEM\\CurrentControlSet\\Services\\nvlddmkm\\Global\\NVTweak",
-        "SYSTEM\\CurrentControlSet\\Services\\nvlddmkm",
-    };
-    HKEY cls;
-    DWORD i = 0;
-    size_t f;
-
-    for (f = 0; f < 2; f++) {
-        set_dword(HKEY_LOCAL_MACHINE, fixed[f], "RMSLIAlwaysApproved", 1);
-        set_dword(HKEY_LOCAL_MACHINE, fixed[f], "RMDynamicSLIAllowed", 1);
-    }
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, CLASS_KEY, 0,
-                      KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &cls)) return;
-
-    for (;;) {
-        char name[16], sub[512], desc[256];
-        DWORD cb = sizeof(name), dcb = sizeof(desc);
-        HKEY dev;
-        if (RegEnumKeyExA(cls, i++, name, &cb, 0,0,0,0)) break;
-        if (cb != 4) continue;
-        _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%s\\%s", CLASS_KEY, name);
-        desc[0] = 0;
-        if (!RegOpenKeyExA(HKEY_LOCAL_MACHINE, sub, 0,
-                           KEY_QUERY_VALUE | KEY_WOW64_64KEY, &dev)) {
-            RegQueryValueExA(dev, "DriverDesc", 0,0, (BYTE *)desc, &dcb);
-            RegCloseKey(dev);
-        }
-        if (!strstr(desc, "NVIDIA")) continue;
-        set_dword(HKEY_LOCAL_MACHINE, sub, "RMSLIAlwaysApproved", 1);
-        set_dword(HKEY_LOCAL_MACHINE, sub, "RMDynamicSLIAllowed", 1);
-        printf("  %s (%s)\n", name, desc);
-    }
-    RegCloseKey(cls);
-}
-
 static int find_driver(char *out, size_t cch)
 {
     HKEY k;
@@ -585,6 +505,64 @@ static int find_driver(char *out, size_t cch)
     return 0;
 }
 
+static void fix_pe_checksum(void)
+{
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_img;
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(g_img + dos->e_lfanew);
+    DWORD *field = &nt->OptionalHeader.CheckSum;
+    DWORD old = *field;
+    unsigned long sum = 0;
+    size_t i;
+
+    *field = 0;
+    for (i = 0; i + 1 < g_len; i += 2) {
+        sum += (unsigned long)(g_img[i] | (g_img[i + 1] << 8));
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    if (g_len & 1) {
+        sum += g_img[g_len - 1];
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    *field = (DWORD)(sum + (unsigned long)g_len);
+    printf("  checksum %#lx -> %#lx\n",
+           (unsigned long)old, (unsigned long)*field);
+}
+
+/* Disable or re-enable the NVIDIA display adapters, which unloads and
+ * reloads the driver so a replaced file takes effect without a reboot. */
+static int devices(BOOL enable)
+{
+    HDEVINFO di = SetupDiGetClassDevsA(&DISPLAY_CLASS, 0, 0, DIGCF_PRESENT);
+    SP_DEVINFO_DATA dev;
+    DWORD i = 0;
+    int n = 0;
+
+    if (di == INVALID_HANDLE_VALUE) return 0;
+    dev.cbSize = sizeof(dev);
+
+    while (SetupDiEnumDeviceInfo(di, i++, &dev)) {
+        char hw[512];
+        SP_PROPCHANGE_PARAMS p;
+
+        hw[0] = 0;
+        if (!SetupDiGetDeviceRegistryPropertyA(di, &dev, SPDRP_HARDWAREID, 0,
+                                               (PBYTE)hw, sizeof(hw), 0)) continue;
+        if (!strstr(hw, "VEN_10DE")) continue;
+
+        ZeroMemory(&p, sizeof(p));
+        p.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+        p.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+        p.StateChange = enable ? DICS_ENABLE : DICS_DISABLE;
+        p.Scope = DICS_FLAG_CONFIGSPECIFIC;
+
+        if (SetupDiSetClassInstallParamsA(di, &dev,
+                (SP_CLASSINSTALL_HEADER *)&p, sizeof(p)) &&
+            SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, di, &dev)) n++;
+    }
+    SetupDiDestroyDeviceInfoList(di);
+    return n;
+}
+
 static int testsigning_on(void)
 {
     typedef LONG (WINAPI *PFN_NQSI)(ULONG, PVOID, ULONG, PULONG);
@@ -599,17 +577,7 @@ static int testsigning_on(void)
     if (!f) return -1;
     if (f(103 /* SystemCodeIntegrityInformation */, &ci, sizeof(ci), NULL) != 0)
         return -1;
-    return (ci.Options & 0x02) ? 1 : 0;      /* CODEINTEGRITY_OPTION_TESTSIGN */
-}
-
-static int ask(const char *q)
-{
-    int c, first;
-    printf("%s (y/n) ", q);
-    fflush(stdout);
-    first = c = getchar();
-    while (c != '\n' && c != EOF) c = getchar();
-    return first == 'y' || first == 'Y';
+    return (ci.Options & 0x02) ? 1 : 0;    /* CODEINTEGRITY_OPTION_TESTSIGN */
 }
 
 int main(int argc, char **argv)
@@ -635,56 +603,39 @@ int main(int argc, char **argv)
         goto done;
     }
     if (!patch()) {
-        printf("\n");
-        if (ask("Set the registry values anyway?")) {
-            printf("\nregistry\n");
-            regkeys();
-            wasSigned = testsigning_on();
-            printf("test signing\n");
-            if (wasSigned == 1) {
-                printf("  already on\n");
-            } else if (!run("bcdedit /set testsigning on")) {
-                printf("  bcdedit failed - set it by hand:"
-                       " bcdedit /set testsigning on\n");
-            }
-
-            /*
-             * A device restart reloads the driver, which is enough to pick up
-             * the new registry values - but only if test signing was already
-             * on. If we just enabled it, that takes effect at boot, so there
-             * is nothing to gain from restarting the adapters here.
-             */
-            if (wasSigned == 1) {
-                printf("\nrestarting the display adapters (the screen may blank)\n");
-                if (devices(FALSE)) {
-                    Sleep(2000);
-                    devices(TRUE);
-                    printf("\ndone. If SLI does not appear, reboot.\n");
-                } else {
-                    printf("  none restarted - reboot to apply\n");
-                }
-            } else {
-                printf("\ndone - reboot to apply"
-                       " (test signing needs a restart)\n");
-            }
-        }
+        printf("\nNothing to do.\n");
         goto done;
     }
+
+    fix_pe_checksum();
 
     f = fopen(tmp, "wb");
     if (!f) { printf("could not write the patched copy\n"); goto done; }
     fwrite(g_img, 1, g_len, f);
     fclose(f);
 
-    printf("registry\n");
-    regkeys();
-
     wasSigned = testsigning_on();
     printf("test signing\n");
     if (wasSigned == 1) {
         printf("  already on\n");
     } else if (!run("bcdedit /set testsigning on")) {
-        printf("  bcdedit failed - set it by hand: bcdedit /set testsigning on\n");
+        /*
+         * Stop here rather than deploying. The patched driver is no longer
+         * signed by NVIDIA, so without test signing it will not load at all -
+         * and replacing the working driver with one that cannot load leaves
+         * the machine on Basic Display until it is put back.
+         */
+        printf("  FAILED\n\n"
+               "Test signing could not be enabled, and the patched driver\n"
+               "cannot load without it. Nothing has been replaced.\n\n"
+               "Almost always this is Secure Boot, which refuses the change\n"
+               "with \"the value is protected by Secure Boot policy\":\n\n"
+               "  1. reboot into UEFI firmware settings\n"
+               "  2. turn Secure Boot off\n"
+               "  3. boot Windows and run this again\n\n"
+               "If Secure Boot is already off, try by hand to see the error:\n"
+               "  bcdedit /set testsigning on\n\n");
+        goto done;
     }
 
     printf("signing\n");
@@ -711,13 +662,8 @@ int main(int argc, char **argv)
     }
     devices(TRUE);
 
-    /*
-     * Replacing the driver and restarting the adapters is enough by itself -
-     * unless test signing had to be turned on, which only takes effect at
-     * boot, and without it the patched driver will not load.
-     */
     if (wasSigned == 1)
-        printf("\ndone. If SLI does not appear, reboot.\n");
+        printf("\ndone.\n");
     else
         printf("\ndone - reboot to apply (test signing needs a restart)\n");
 
