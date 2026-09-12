@@ -592,7 +592,7 @@ int main(int argc, char **argv)
 {
     char live[MAX_PATH], tmp[MAX_PATH], sys32[MAX_PATH];
     int pause = (argc > 1 && !strcmp(argv[1], "--pause"));
-    int wasSigned;
+    int wasSigned, ok = 0;
     FILE *f;
     UINT n;
 
@@ -674,15 +674,16 @@ int main(int argc, char **argv)
     }
     devices(TRUE);
 
+    ok = 1;
     if (wasSigned == 1)
         printf("\ndone.\n");
     else
         printf("\ndone - reboot to apply (test signing needs a restart)\n");
 
 done:
-    if (pause || owns_console()) {
+    if (!ok && (pause || owns_console())) {
         printf("\npress Enter to close...");
         getchar();
     }
-    return 0;
+    return ok ? 0 : 1;
 }
