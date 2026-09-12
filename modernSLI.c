@@ -50,8 +50,6 @@ static size_t         g_len;
 static IMAGE_SECTION_HEADER *g_sec;
 static DWORD          g_nsec;
 
-/* ---------------------------------------------------------------- image */
-
 static int load_image(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -312,7 +310,7 @@ static int make_cert_win7(void)
         "[NewRequest]\r\n"
         "Subject=\"CN=%s\"\r\n"
         "KeyLength=2048\r\n"
-        "KeyUsage=0x80\r\n" 
+        "KeyUsage=0x80\r\n"
         "MachineKeySet=false\r\n"
         "KeySpec=2\r\n"
         "ProviderName=\"Microsoft Enhanced Cryptographic Provider v1.0\"\r\n"
@@ -338,7 +336,6 @@ static int make_cert_win7(void)
     run(cmd);
     return 1;
 }
-
 
 typedef struct { DWORD cbSize; LPCWSTR pwszFileName; HANDLE hFile; } SGN_FILE;
 typedef struct { DWORD cbSize; DWORD *pdwIndex; DWORD dwSubjectChoice;
@@ -588,6 +585,22 @@ static int find_driver(char *out, size_t cch)
     return 0;
 }
 
+static int testsigning_on(void)
+{
+    typedef LONG (WINAPI *PFN_NQSI)(ULONG, PVOID, ULONG, PULONG);
+    struct { ULONG Length; ULONG Options; } ci;
+    HMODULE h;
+    PFN_NQSI f;
+
+    ci.Length = sizeof(ci);
+    ci.Options = 0;
+    h = GetModuleHandleA("ntdll.dll");
+    f = h ? (PFN_NQSI)GetProcAddress(h, "NtQuerySystemInformation") : NULL;
+    if (!f) return -1;
+    if (f(103 /* SystemCodeIntegrityInformation */, &ci, sizeof(ci), NULL) != 0)
+        return -1;
+    return (ci.Options & 0x02) ? 1 : 0;      /* CODEINTEGRITY_OPTION_TESTSIGN */
+}
 
 static int ask(const char *q)
 {
@@ -603,6 +616,7 @@ int main(int argc, char **argv)
 {
     char live[MAX_PATH], tmp[MAX_PATH], sys32[MAX_PATH];
     int pause = (argc > 1 && !strcmp(argv[1], "--pause"));
+    int wasSigned;
     FILE *f;
     UINT n;
 
@@ -625,11 +639,34 @@ int main(int argc, char **argv)
         if (ask("Set the registry values anyway?")) {
             printf("\nregistry\n");
             regkeys();
+            wasSigned = testsigning_on();
             printf("test signing\n");
-            if (!run("bcdedit /set testsigning on"))
+            if (wasSigned == 1) {
+                printf("  already on\n");
+            } else if (!run("bcdedit /set testsigning on")) {
                 printf("  bcdedit failed - set it by hand:"
                        " bcdedit /set testsigning on\n");
-            printf("\ndone - reboot to apply\n");
+            }
+
+            /*
+             * A device restart reloads the driver, which is enough to pick up
+             * the new registry values - but only if test signing was already
+             * on. If we just enabled it, that takes effect at boot, so there
+             * is nothing to gain from restarting the adapters here.
+             */
+            if (wasSigned == 1) {
+                printf("\nrestarting the display adapters (the screen may blank)\n");
+                if (devices(FALSE)) {
+                    Sleep(2000);
+                    devices(TRUE);
+                    printf("\ndone. If SLI does not appear, reboot.\n");
+                } else {
+                    printf("  none restarted - reboot to apply\n");
+                }
+            } else {
+                printf("\ndone - reboot to apply"
+                       " (test signing needs a restart)\n");
+            }
         }
         goto done;
     }
@@ -641,9 +678,14 @@ int main(int argc, char **argv)
 
     printf("registry\n");
     regkeys();
+
+    wasSigned = testsigning_on();
     printf("test signing\n");
-    if (!run("bcdedit /set testsigning on"))
+    if (wasSigned == 1) {
+        printf("  already on\n");
+    } else if (!run("bcdedit /set testsigning on")) {
         printf("  bcdedit failed - set it by hand: bcdedit /set testsigning on\n");
+    }
 
     printf("signing\n");
     if (!sign(tmp)) {
@@ -669,7 +711,15 @@ int main(int argc, char **argv)
     }
     devices(TRUE);
 
-    printf("\ndone - reboot to apply\n");
+    /*
+     * Replacing the driver and restarting the adapters is enough by itself -
+     * unless test signing had to be turned on, which only takes effect at
+     * boot, and without it the patched driver will not load.
+     */
+    if (wasSigned == 1)
+        printf("\ndone. If SLI does not appear, reboot.\n");
+    else
+        printf("\ndone - reboot to apply (test signing needs a restart)\n");
 
 done:
     if (pause) { printf("\npress Enter to close..."); getchar(); }
