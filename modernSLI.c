@@ -204,20 +204,22 @@ static int elevated(void)
     return ok;
 }
 
-static void relaunch(void)
+static int relaunch(void)
 {
     wchar_t exe[MAX_PATH];
     SHELLEXECUTEINFOW s = { sizeof(s) };
-    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
     s.fMask = SEE_MASK_NOCLOSEPROCESS;
     s.lpVerb = L"runas";
     s.lpFile = exe;
     s.lpParameters = L"--pause";     /* keep the new console open to read */
     s.nShow = SW_SHOWNORMAL;
-    if (ShellExecuteExW(&s) && s.hProcess) {
+    if (!ShellExecuteExW(&s)) return 0;          /* declined, or failed */
+    if (s.hProcess) {
         WaitForSingleObject(s.hProcess, INFINITE);
         CloseHandle(s.hProcess);
     }
+    return 1;
 }
 
 static int take_ownership(const char *path)
@@ -579,6 +581,12 @@ static int testsigning_on(void)
         return -1;
     return (ci.Options & 0x02) ? 1 : 0;    /* CODEINTEGRITY_OPTION_TESTSIGN */
 }
+static int owns_console(void)
+{
+    DWORD pids[2];
+    DWORD n = GetConsoleProcessList(pids, 2);
+    return n <= 1;
+}
 
 int main(int argc, char **argv)
 {
@@ -588,7 +596,11 @@ int main(int argc, char **argv)
     FILE *f;
     UINT n;
 
-    if (!elevated()) { relaunch(); return 0; }
+    if (!elevated()) {
+        if (relaunch()) return 0;               /* the elevated copy took over */
+        printf("administrator rights are required\n");
+        goto done;
+    }
 
     if (!find_driver(live, MAX_PATH)) {
         printf("no NVIDIA driver found\n");
@@ -668,6 +680,9 @@ int main(int argc, char **argv)
         printf("\ndone - reboot to apply (test signing needs a restart)\n");
 
 done:
-    if (pause) { printf("\npress Enter to close..."); getchar(); }
+    if (pause || owns_console()) {
+        printf("\npress Enter to close...");
+        getchar();
+    }
     return 0;
 }
